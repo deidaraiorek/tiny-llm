@@ -25,14 +25,58 @@ class Qwen3MultiHeadAttention:
         theta: int = 1000000,
         rms_norm_eps: float = 1e-5,
     ):
-        pass
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.wq = wq
+        self.wk = wk
+        self.wv = wv
+        self.wo = wo
+        self.q_norm = q_norm
+        self.k_norm = k_norm
+        self.rms_norm_eps = rms_norm_eps
+        self.scale = head_dim**-0.5
+        self.rope = RoPE(dims=head_dim, seq_len=max_seq_len,
+                         base=theta, traditional=False)
 
     def __call__(
         self,
         x: mx.array,
         mask: mx.array | str | None = None,
     ) -> mx.array:
-        pass
+        q = linear(x, self.wq)
+        k = linear(x, self.wk)
+        v = linear(x, self.wv)
+        q = q.reshape(*q.shape[:-1], self.num_heads,
+                      self.head_dim)      # -> (B, L, H_q, D)
+        k = k.reshape(*k.shape[:-1], self.num_kv_heads,
+                      self.head_dim)   # -> (B, L, H, D)
+        v = v.reshape(*v.shape[:-1], self.num_kv_heads,
+                      self.head_dim)   # -> (B, L, H, D)
+        q = mx.fast.rms_norm(q, self.q_norm, self.rms_norm_eps)
+        k = mx.fast.rms_norm(k, self.k_norm, self.rms_norm_eps)
+
+        L = x.shape[-2]
+        q = self.rope(q, offset=slice(0, L))
+        k = self.rope(k, offset=slice(0, L))
+
+        q = q.swapaxes(-3, -2)  # -> (B, H_q, L, D)
+        k = k.swapaxes(-3, -2)  # -> (B, H, L, D)
+        v = v.swapaxes(-3, -2)  # -> (B, H, L, D)
+
+        orig_dtype = q.dtype
+        q = q.astype(mx.float32)
+        k = k.astype(mx.float32)
+        v = v.astype(mx.float32)
+        attn = scaled_dot_product_attention_grouped(
+            q, k, v, scale=self.scale, mask=mask)
+        attn = attn.astype(orig_dtype)
+
+        attn = attn.swapaxes(-3, -2)  # -> (B, L, H_q, D)
+        # -> (B, L, H_q*D)
+        attn = attn.reshape(*attn.shape[:-2], self.num_heads * self.head_dim)
+        return linear(attn, self.wo)
 
 
 class Qwen3MLP:
@@ -44,10 +88,17 @@ class Qwen3MLP:
         w_up: mx.array,
         w_down: mx.array,
     ):
-        pass
+        self.dim = dim
+        self.hidden_dim = hidden_dim
+        self.w_gate = w_gate
+        self.w_up = w_up
+        self.w_down = w_down
 
     def __call__(self, x: mx.array) -> mx.array:
-        pass
+        up = linear(x, self.w_up)
+        gate = silu(linear(x, self.w_gate))
+        gated = gate * up
+        return linear(gated, self.w_down)
 
 
 class Qwen3TransformerBlock:
